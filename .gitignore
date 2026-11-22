@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local application data and secrets
+backend/*.db
+backend/*.sqlite
+.env
+.env.*
+
+# JavaScript
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
