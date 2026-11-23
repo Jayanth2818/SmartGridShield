@@ -78,6 +78,15 @@ def seed_demo_data():
   ])
   log(db,'demo_data_seeded','SGS-DEMO-ALICE','fictional demonstration identity, history, and approved research case created');db.commit()
 seed_demo_data()
+def repair_demo_credential():
+ """Keep the fictional classroom card usable after a local secret/database change."""
+ with Session(engine) as db:
+  u=db.scalar(select(User).where(User.sg_id=='SGS-DEMO-ALICE'))
+  if not u:return
+  try: VAULT.decrypt(u.private_key.encode())
+  except Exception:
+   key=Ed25519PrivateKey.generate();pub=b64(key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw));private=b64(key.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption()));issued=int(time.time());u.public_key=pub;u.private_key=VAULT.encrypt(private.encode()).decode();u.credential=token({'sg_id':u.sg_id,'permissions':json.loads(u.permissions),'pub':pub,'issued':issued,'expires':issued+31536000});u.revoked=False;log(db,'demo_credential_repaired',u.sg_id,'local demo key material refreshed');db.commit()
+repair_demo_credential()
 def verify(t):
  try:
   raw,s=t.split('.');ISSUER.public_key().verify(base64.urlsafe_b64decode(s+'='*(-len(s)%4)),raw.encode());return json.loads(base64.urlsafe_b64decode(raw+'='*(-len(raw)%4)))
