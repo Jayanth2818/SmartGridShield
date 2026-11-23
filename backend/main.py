@@ -1,5 +1,5 @@
 """SmartGridShield: isolated, local-only research prototype."""
-import base64, hashlib, json, secrets, time
+import base64, hashlib, json, secrets, time, os
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import PlainTextResponse
@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, String, Integer, Boolean, Text, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 from argon2 import PasswordHasher
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 
 DB=Path(__file__).parent/'smartgridshield.db'; engine=create_engine(f'sqlite:///{DB}',connect_args={'check_same_thread':False})
@@ -35,14 +35,27 @@ class Investigation(Base):
 class ServiceSession(Base):
  __tablename__='service_sessions'
  id:Mapped[str]=mapped_column(String,primary_key=True); sg_id:Mapped[str]=mapped_column(String); service:Mapped[str]=mapped_column(String); expires:Mapped[int]=mapped_column(Integer); consumed_operations:Mapped[int]=mapped_column(Integer,default=0)
+class LoginSession(Base):
+ __tablename__='login_sessions'
+ id:Mapped[str]=mapped_column(String,primary_key=True); token_hash:Mapped[str]=mapped_column(String,unique=True); user_id:Mapped[int]=mapped_column(Integer); expires:Mapped[int]=mapped_column(Integer); revoked:Mapped[bool]=mapped_column(Boolean,default=False)
 Base.metadata.create_all(engine)
 # Lightweight migration for local SQLite databases created before the role field.
 with engine.begin() as conn:
  cols=[x[1] for x in conn.exec_driver_sql('PRAGMA table_info(users)').fetchall()]
  if 'role' not in cols:conn.exec_driver_sql("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
-SECRET=hashlib.sha256(b'SmartGridShield local research demo').digest(); ISSUER=Ed25519PrivateKey.from_private_bytes(SECRET); VAULT=Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET+b'vault').digest())); PWD=PasswordHasher()
-ADMIN_KEY='demo-admin-local-key'
+_secret_path=Path(__file__).parent/'.demo_secret'
+if os.getenv('SMARTGRIDSHIELD_SECRET'): SECRET=hashlib.sha256(os.environ['SMARTGRIDSHIELD_SECRET'].encode()).digest()
+elif _secret_path.exists(): SECRET=base64.urlsafe_b64decode(_secret_path.read_text().encode())
+else:
+ SECRET=secrets.token_bytes(32);_secret_path.write_text(base64.urlsafe_b64encode(SECRET).decode())
+ISSUER=Ed25519PrivateKey.from_private_bytes(SECRET); VAULT=Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET+b'vault').digest())); PWD=PasswordHasher()
+ADMIN_KEY=os.getenv('SMARTGRIDSHIELD_ADMIN_KEY','demo-admin-local-key')
 app=FastAPI(title='SmartGridShield API'); app.add_middleware(CORSMiddleware,allow_origins=['http://localhost:5173','http://127.0.0.1:5173'],allow_methods=['*'],allow_headers=['*'])
+@app.get('/health')
+def health(): return {'status':'ok','service':'SmartGridShield API','demo_mode':True}
+@app.get('/')
+def root(): return {'name':'SmartGridShield','status':'ok','docs':'/docs'}
+LOGIN_ATTEMPTS:dict[str,tuple[int,int]]={}
 def b64(x):return base64.urlsafe_b64encode(x).decode().rstrip('=')
 def log(db,event,sg='',detail=''):db.add(Audit(ts=int(time.time()),event=event,sg_id=sg,detail=detail))
 def token(claims):
@@ -72,11 +85,28 @@ def verify(t):
 class Register(BaseModel):full_name:str;email:str;username:str;password:str;government_id_type:str;government_id_number:str;phone:str|None=None;consent:bool
 class Auth(BaseModel):credential:str;challenge_id:str;proof:str
 class CardLogin(BaseModel):smart_grid_id:str
+class PasswordLogin(BaseModel):identifier:str;password:str
 class ServiceAction(BaseModel):smart_grid_id:str;record_type:str;payload:dict
 class Revoke(BaseModel):reason:str
 class InvestigationCreate(BaseModel):incident_id:str;target_sg_id:str;requester:str;reason:str;evidence:str
 class InvestigationDecision(BaseModel):approver:str;approved:bool
 class PermissionUpdate(BaseModel):permissions:list[str]
+def token_hash(token:str):return hashlib.sha256(token.encode()).hexdigest()
+def issue_session(db,u):
+ raw=secrets.token_urlsafe(32);db.add(LoginSession(id=secrets.token_hex(12),token_hash=token_hash(raw),user_id=u.id,expires=int(time.time())+1800));return raw
+def current_user(authorization:str|None):
+ if not authorization or not authorization.startswith('Bearer '):raise HTTPException(401,'Authenticated session required')
+ raw=authorization[7:]
+ with Session(engine) as db:
+  s=db.scalar(select(LoginSession).where(LoginSession.token_hash==token_hash(raw)))
+  if not s or s.revoked or s.expires<int(time.time()):raise HTTPException(401,'Session expired or invalid')
+  u=db.get(User,s.user_id)
+  if not u or u.revoked:raise HTTPException(401,'Account unavailable')
+  return {'id':u.id,'sg_id':u.sg_id,'role':u.role,'permissions':json.loads(u.permissions)}
+def require_role(authorization:str|None,*roles:str):
+ u=current_user(authorization)
+ if u['role'] not in roles:raise HTTPException(403,'Insufficient role permission')
+ return u
 @app.post('/api/register')
 def register(x:Register):
  if not x.consent or len(x.password)<10:raise HTTPException(400,'Consent and a 10-character password are required')
@@ -85,22 +115,53 @@ def register(x:Register):
   if db.scalar(select(User).where((User.username==x.username)|(User.email==x.email))):raise HTTPException(409,'Account already exists')
   sg='SGS-'+secrets.token_hex(5).upper();key=Ed25519PrivateKey.generate();pub=b64(key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw));priv=b64(key.private_bytes(serialization.Encoding.Raw,serialization.PrivateFormat.Raw,serialization.NoEncryption()));cred=token({'sg_id':sg,'permissions':['p2p','ev','microgrid'],'pub':pub,'issued':int(time.time()),'expires':int(time.time())+31536000})
   db.add(User(username=x.username,email=x.email,password=PWD.hash(x.password),sg_id=sg,credential=cred,public_key=pub,private_key=VAULT.encrypt(priv.encode()).decode()));db.add(Vault(sg_id=sg,identity=VAULT.encrypt(json.dumps({'name':x.full_name,'government_id':x.government_id_number,'phone':x.phone}).encode()).decode()));log(db,'credential_issued',sg,'mock verification accepted');db.commit();return {'smart_grid_id':sg,'credential':cred,'verification':'verified','card':{'issuer':'SmartGridShield Demo Issuer','fingerprint':hashlib.sha256(pub.encode()).hexdigest()[:16]}}
+@app.post('/api/login')
+def password_login(x:PasswordLogin):
+ key=x.identifier.lower();count,until=LOGIN_ATTEMPTS.get(key,(0,0))
+ if until>int(time.time()):raise HTTPException(429,'Too many login attempts. Try again later.')
+ with Session(engine) as db:
+  u=db.scalar(select(User).where((User.username==x.identifier)|(User.email==x.identifier)))
+  try: valid=bool(u) and PWD.verify(u.password,x.password)
+  except Exception:valid=False
+  if not valid:
+   count+=1;LOGIN_ATTEMPTS[key]=(count,int(time.time())+min(300,2**count) if count>=5 else 0);log(db,'login_failed',u.sg_id if u else '','invalid credential');db.commit();raise HTTPException(401,'Invalid username/email or password')
+  LOGIN_ATTEMPTS.pop(key,None)
+  raw=secrets.token_urlsafe(32);db.add(LoginSession(id=secrets.token_hex(12),token_hash=token_hash(raw),user_id=u.id,expires=int(time.time())+1800));log(db,'login_success',u.sg_id,'password session issued');db.commit()
+  # In this local prototype the signed presentation credential is restored to the
+  # simulated wallet after an authenticated password login. A production wallet
+  # would retain it in device-secure storage and never ask this API for it.
+  return {'access_token':raw,'token_type':'bearer','expires_in':1800,'smart_grid_id':u.sg_id,'role':u.role,'credential':u.credential}
+@app.post('/api/logout')
+def logout(authorization:str|None=Header(None)):
+ if not authorization or not authorization.startswith('Bearer '):raise HTTPException(401,'Authenticated session required')
+ with Session(engine) as db:
+  s=db.scalar(select(LoginSession).where(LoginSession.token_hash==token_hash(authorization[7:])))
+  if s:s.revoked=True;db.commit()
+ return {'logged_out':True}
+@app.get('/api/me')
+def me(authorization:str|None=Header(None)):
+ actor=current_user(authorization)
+ with Session(engine) as db:
+  u=db.scalar(select(User).where(User.sg_id==actor['sg_id']))
+  return {**actor,'credential':u.credential}
 @app.post('/api/card-login')
 def card_login(x:CardLogin):
  """Demo-only smart-card presentation endpoint; real cards require a holder-held key and PIN."""
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id==x.smart_grid_id))
   if not u or u.revoked: raise HTTPException(401,'Smart Grid Card is invalid or revoked')
-  log(db,'card_login',u.sg_id,'demo smart-card presentation');db.commit();return {'smart_grid_id':u.sg_id,'credential':u.credential,'permissions':json.loads(u.permissions)}
+  raw=issue_session(db,u);log(db,'card_login',u.sg_id,'demo smart-card presentation');db.commit();return {'smart_grid_id':u.sg_id,'credential':u.credential,'access_token':raw,'permissions':json.loads(u.permissions)}
 @app.post('/api/prepared-demo')
 def prepared_demo():
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id=='SGS-DEMO-ALICE'))
   if not u: raise HTTPException(404,'Register one demo identity first')
-  log(db,'demo_card_login',u.sg_id,'one-click classroom demo');db.commit()
-  return {'smart_grid_id':u.sg_id,'credential':u.credential,'permissions':json.loads(u.permissions)}
+  raw=issue_session(db,u);log(db,'demo_card_login',u.sg_id,'one-click classroom demo');db.commit()
+  return {'smart_grid_id':u.sg_id,'credential':u.credential,'permissions':json.loads(u.permissions),'access_token':raw,'expires_in':1800}
 @app.post('/api/service/{service}/action')
-def service_action(service:str,x:ServiceAction):
+def service_action(service:str,x:ServiceAction,authorization:str|None=Header(None)):
+ actor=current_user(authorization)
+ if actor['sg_id']!=x.smart_grid_id:raise HTTPException(403,'Cannot operate as another identity')
  if service not in {'p2p','ev','microgrid'}:raise HTTPException(404,'Unknown service')
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id==x.smart_grid_id))
@@ -111,7 +172,9 @@ def service_action(service:str,x:ServiceAction):
   session.consumed_operations+=1
   r=ServiceRecord(ts=int(time.time()),sg_id=u.sg_id,service=service,record_type=x.record_type,payload=json.dumps(x.payload),status='active');db.add(r);log(db,'service_operation',u.sg_id,f'{service}:{x.record_type}');db.commit();return {'id':r.id,'status':r.status,'record_type':r.record_type,'payload':x.payload}
 @app.post('/api/credentials/{sg_id}/revoke')
-def revoke_credential(sg_id:str,x:Revoke):
+def revoke_credential(sg_id:str,x:Revoke,authorization:str|None=Header(None)):
+ actor=current_user(authorization)
+ if actor['sg_id']!=sg_id and actor['role']!='admin':raise HTTPException(403,'Cannot revoke another identity')
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id==sg_id))
   if not u:raise HTTPException(404,'Smart Grid identity not found')
@@ -153,7 +216,9 @@ def dashboard(sg_id:str):
   if not u:raise HTTPException(404,'Unknown identity')
   events=db.scalars(select(Audit).where(Audit.sg_id==sg_id).order_by(Audit.id.desc()).limit(20)).all();return {'identity':{'sg_id':u.sg_id,'revoked':u.revoked,'permissions':json.loads(u.permissions),'fingerprint':hashlib.sha256(u.public_key.encode()).hexdigest()[:16]},'events':[{'event':e.event,'timestamp':e.ts,'detail':e.detail}for e in events]}
 @app.post('/api/challenges/{sg_id}/{service}/{action}')
-def challenge(sg_id:str,service:str,action:str):
+def challenge(sg_id:str,service:str,action:str,authorization:str|None=Header(None)):
+ actor=current_user(authorization)
+ if actor['sg_id']!=sg_id:raise HTTPException(403,'Cannot request a challenge for another identity')
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id==sg_id));
   if not u or u.revoked:raise HTTPException(403,'Credential revoked or unknown')
@@ -165,9 +230,10 @@ def authenticate(x:Auth):
  with Session(engine) as db:
   c=db.get(Challenge,x.challenge_id);u=db.scalar(select(User).where(User.sg_id==claims['sg_id']))
   if not c or c.consumed or c.expires<int(time.time()):log(db,'authentication_failed',claims.get('sg_id',''),'replayed/expired');db.commit();raise HTTPException(401,'Challenge expired, missing, or already consumed')
-  if not u or u.revoked or c.sg_id!=u.sg_id:raise HTTPException(403,'Credential revoked or challenge mismatch')
+  if claims.get('expires',0)<int(time.time()):raise HTTPException(401,'Credential has expired')
+  if not u or u.revoked or c.sg_id!=u.sg_id or c.service not in claims.get('permissions',[]):raise HTTPException(403,'Credential revoked, unscoped, or challenge mismatch')
   data=f'{c.id}|{c.nonce}|{c.service}|{c.action}'.encode()
-  try: Ed25519PrivateKey.from_private_bytes(base64.urlsafe_b64decode(VAULT.decrypt(u.private_key.encode()).decode()+'='*(-len(VAULT.decrypt(u.private_key.encode()).decode())%4))).public_key().verify(base64.urlsafe_b64decode(x.proof+'='*(-len(x.proof)%4)),data)
+  try: Ed25519PublicKey.from_public_bytes(base64.urlsafe_b64decode(claims['pub']+'='*(-len(claims['pub'])%4))).verify(base64.urlsafe_b64decode(x.proof+'='*(-len(x.proof)%4)),data)
   except:raise HTTPException(401,'Proof of key possession failed')
   c.consumed=True;session=ServiceSession(id=secrets.token_urlsafe(24),sg_id=u.sg_id,service=c.service,expires=int(time.time())+120);db.add(session);log(db,'authentication_success',u.sg_id,f'{c.service}:{c.action}');db.commit();return {'accepted':True,'service_pseudonym':hashlib.sha256((u.sg_id+c.service).encode()).hexdigest()[:20],'service':c.service,'action':c.action,'operation_authorization_expires_in':120}
 @app.post('/api/demo-wallet-proof/{challenge_id}')
@@ -188,11 +254,13 @@ def audit_export():
   lines=['timestamp,event,smart_grid_id,detail']+[f'{x.ts},{x.event},{x.sg_id},{json.dumps(x.detail)}'for x in rows]
   return '\n'.join(lines)
 @app.get('/api/credentials/{sg_id}')
-def credential_info(sg_id:str):
+def credential_info(sg_id:str,authorization:str|None=Header(None)):
+ actor=current_user(authorization)
+ if actor['sg_id']!=sg_id and actor['role']!='admin':raise HTTPException(403,'Credential metadata is private')
  with Session(engine) as db:
   u=db.scalar(select(User).where(User.sg_id==sg_id))
   if not u:raise HTTPException(404,'Identity not found')
-  claims=verify(u.credential);return {'sg_id':sg_id,'status':'revoked' if u.revoked else 'active','issuer':'SmartGridShield Demo Issuer','permissions':json.loads(u.permissions),'issued':claims['issued'],'expires':claims['expires'],'fingerprint':hashlib.sha256(u.public_key.encode()).hexdigest()[:16]}
+  claims=verify(u.credential);return {'sg_id':sg_id,'status':'revoked' if u.revoked else 'active','issuer':'SmartGridShield Demo Issuer','permissions':json.loads(u.permissions),'issued':claims['issued'],'expires':claims['expires'],'fingerprint':hashlib.sha256(u.public_key.encode()).hexdigest()[:16],'credential':u.credential}
 def require_admin(key:str):
  if key!=ADMIN_KEY:raise HTTPException(403,'Administrator authorization required')
 @app.get('/api/admin/summary')

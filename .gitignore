@@ -8,6 +8,7 @@ backend/*.db
 backend/*.sqlite
 .env
 .env.*
+backend/.demo_secret
 
 # JavaScript
 frontend/node_modules/
